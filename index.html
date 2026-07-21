@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LEF to TAR Converter</title>
+    <!-- JSZip for handling the incoming ZIP data and packaging the output -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        :root {
+            --primary: #3b82f6;
+            --bg: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --border: #e2e8f0;
+        }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            line-height: 1.5;
+        }
+        .container {
+            background: var(--surface);
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+        }
+        #drop-zone {
+            border: 2px dashed var(--primary);
+            border-radius: 8px;
+            padding: 3rem 2rem;
+            text-align: center;
+            background: #eff6ff;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        #drop-zone.dragover {
+            background: #dbeafe;
+            border-color: #2563eb;
+        }
+        #file-input { display: none; }
+        .log-container {
+            margin-top: 1.5rem;
+            background: #1e293b;
+            color: #f8fafc;
+            padding: 1rem;
+            border-radius: 8px;
+            font-family: monospace;
+            height: 250px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            font-size: 0.875rem;
+        }
+        .btn {
+            display: inline-block;
+            background: var(--primary);
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 6px;
+            font-weight: 600;
+            border: none;
+            cursor: pointer;
+            margin-top: 1rem;
+            text-decoration: none;
+        }
+        .btn:disabled { background: #94a3b8; cursor: not-allowed; }
+        .hidden { display: none; }
+        .success { color: #4ade80; }
+        .error { color: #f87171; }
+        .info { color: #60a5fa; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>LEF to TAR Converter</h2>
+    <p>Drop your `.lef` files here. The tool will locally strip junk headers, extract the internal ZIP, repackage it as a TAR, and provide a single downloaded package. <strong>100% local processing.</strong></p>
+
+    <div id="drop-zone">
+        <p>Drag & drop `.lef` files here, or click to select files</p>
+        <input type="file" id="file-input" multiple accept=".lef" />
+    </div>
+
+    <button id="download-btn" class="btn hidden">Download Converted Package</button>
+
+    <div class="log-container" id="log-output">System ready. Waiting for files...</div>
+</div>
+
+<script>
+    // --- Minimal TAR Builder ---
+    // Converts extracted JSZip files into a standard POSIX uncompressed TAR ArrayBuffer
+    class TarBuilder {
+        constructor() { this.buffers = []; }
+        
+        addFile(name, uint8Array) {
+            const header = new Uint8Array(512);
+            
+            // 1. File name (up to 100 chars)
+            this.writeString(header, 0, name.substring(0, 100));
+            // 2. File mode, uid, gid
+            this.writeString(header, 100, "0000644\0"); 
+            this.writeString(header, 108, "0000000\0");
+            this.writeString(header, 116, "0000000\0");
+            
+            // 3. Size (Octal)
+            let sizeStr = uint8Array.length.toString(8).padStart(11, '0') + " ";
+            this.writeString(header, 124, sizeStr);
+            
+            // 4. MTime (Octal)
+            let mtime = Math.floor(Date.now() / 1000).toString(8).padStart(11, '0') + " ";
+            this.writeString(header, 136, mtime);
+            
+            // 5. Checksum placeholder
+            this.writeString(header, 148, "        "); 
+            
+            // 6. Type flag (0 = regular file)
+            header[156] = 48; // '0'
+            
+            // 7. Magic & Version (ustar)
+            this.writeString(header, 257, "ustar\0");
+            this.writeString(header, 263, "00");
+
+            // Calculate Checksum
+            let chksum = 0;
+            for(let i = 0; i < 512; i++) chksum += header[i];
+            let chksumStr = chksum.toString(8).padStart(6, '0') + "\0 ";
+            this.writeString(header, 148, chksumStr);
+
+            this.buffers.push(header);
+            this.buffers.push(uint8Array);
+
+            // Pad file content to nearest 512 bytes
+            const padding = (512 - (uint8Array.length % 512)) % 512;
+            if (padding > 0) this.buffers.push(new Uint8Array(padding));
+        }
+
+        writeString(buf, offset, str) {
+            for(let i = 0; i < str.length; i++) buf[offset + i] = str.charCodeAt(i);
+        }
+
+        build() {
+            // Append two 512-byte blocks of zeros to signify end of archive
+            this.buffers.push(new Uint8Array(1024)); 
+            
+            let totalLength = this.buffers.reduce((sum, b) => sum + b.length, 0);
+            let out = new Uint8Array(totalLength);
+            let offset = 0;
+            for(let b of this.buffers) {
+                out.set(b, offset);
+                offset += b.length;
+            }
+            return out;
+        }
+    }
+
+    // --- Core UI & App Logic ---
+    const dropZone = document.getElementById('drop-zone');
+    const fileInput = document.getElementById('file-input');
+    const logOutput = document.getElementById('log-output');
+    const downloadBtn = document.getElementById('download-btn');
+    
+    let finalZipBlob = null;
+
+    function log(message, type = '') {
+        const span = document.createElement('div');
+        if(type) span.className = type;
+        span.textContent = message;
+        logOutput.appendChild(span);
+        logOutput.scrollTop = logOutput.scrollHeight;
+    }
+
+    // Event Listeners
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.classList.add('dragover');
+    });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+        if (e.dataTransfer.files.length) processFiles(e.dataTransfer.files);
+    });
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length) processFiles(e.target.files);
+    });
+
+    downloadBtn.addEventListener('click', () => {
+        if (!finalZipBlob) return;
+        const url = URL.createObjectURL(finalZipBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'converted_lef_files.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    });
+
+    async function processFiles(files) {
+        logOutput.innerHTML = ''; // clear logs
+        downloadBtn.classList.add('hidden');
+        finalZipBlob = null;
+
+        const packageZip = new JSZip(); // The final ZIP containing all the new TAR files
+        let processedCount = 0;
+
+        for (const file of files) {
+            log(`\nProcessing: ${file.name}`, 'info');
+            
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const bytes = new Uint8Array(arrayBuffer);
+                
+                // 1. Search for ZIP magic number PK\x03\x04 (0x50 0x4B 0x03 0x04)
+                let zipStart = -1;
+                for (let i = 0; i < bytes.length - 3; i++) {
+                    if (bytes[i] === 0x50 && bytes[i+1] === 0x4B && bytes[i+2] === 0x03 && bytes[i+3] === 0x04) {
+                        zipStart = i;
+                        break;
+                    }
+                }
+
+                if (zipStart === -1) {
+                    log(`  [ERROR] Failed to extract ${file.name}. No valid ZIP data found.`, 'error');
+                    continue;
+                }
+
+                if (zipStart > 0) log(`  Found junk header. Stripping ${zipStart} bytes...`);
+                
+                // 2. Slice out the clean ZIP
+                const cleanZipBuffer = arrayBuffer.slice(zipStart);
+                
+                // 3. Load with JSZip
+                const zip = await JSZip.loadAsync(cleanZipBuffer);
+                
+                // 4. Extract contents & build TAR
+                const tarBuilder = new TarBuilder();
+                let fileCount = 0;
+
+                for (const [relativePath, zipEntry] of Object.entries(zip.files)) {
+                    if (zipEntry.dir) continue; // Skip folders, TAR infers them naturally
+                    const fileData = await zipEntry.async("uint8array");
+                    tarBuilder.addFile(relativePath, fileData);
+                    fileCount++;
+                }
+
+                // 5. Finalize TAR and add it to our master package
+                const tarBuffer = tarBuilder.build();
+                packageZip.file(file.name, tarBuffer); // Keeps the original .lef extension as requested
+                
+                log(`  [SUCCESS] Extracted ${fileCount} files. Converted to TAR format: ${file.name}`, 'success');
+                processedCount++;
+
+            } catch (err) {
+                log(`  [ERROR] Failed processing ${file.name}: ${err.message}`, 'error');
+            }
+        }
+
+        if (processedCount > 0) {
+            log(`\nPackaging ${processedCount} converted file(s) into a master ZIP...`, 'info');
+            finalZipBlob = await packageZip.generateAsync({ type: "blob", compression: "DEFLATE" });
+            log(`[DONE] Package ready for download.`, 'success');
+            downloadBtn.classList.remove('hidden');
+        } else {
+            log(`\n[WARNING] No files were successfully processed.`, 'error');
+        }
+    }
+</script>
+
+</body>
+</html>
